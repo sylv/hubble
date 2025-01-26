@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT \n            id, parent_id, season_number as \"season_number: _\", episode_number as \"episode_number: _\"\n            FROM episodes\n            WHERE parent_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "parent_id",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "season_number: _",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "episode_number: _",
+        "ordinal": 3,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a21f2a09c4fd869ea428d2aa243167753bf8d41636b50f4c9552557a4f875d82"
+}

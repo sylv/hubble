@@ -1,0 +1,12 @@
+services:
+  hubble:
+    container_name: hubble
+    image: sylver/hubble
+    restart: unless-stopped
+    ports:
+      - 8000:8000
+    volumes:
+      - hubble-data:/data
+
+volumes:
+    hubble-data: {}

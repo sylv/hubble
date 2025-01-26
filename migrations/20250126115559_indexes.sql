@@ -1,0 +1,1 @@
+CREATE INDEX idx_episode_parent_id ON episodes(parent_id);
