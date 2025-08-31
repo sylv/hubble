@@ -1,3 +1,6 @@
-data/
-target/
-.env
+*
+!src
+!migrations
+!Cargo.toml
+!Cargo.lock
+!README.md

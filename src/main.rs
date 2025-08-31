@@ -36,23 +36,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
     dotenv::dotenv().ok();
 
-    let data_dir = std::path::PathBuf::from(
-        std::env::var("HUBBLE_DATA_DIR").expect("HUBBLE_DATA_DIR must be set"),
-    );
+    let data_dir =
+        std::path::PathBuf::from(std::env::var("DATA_DIR").expect("DATA_DIR must be set"));
 
     // ensure data dir exists
-    std::fs::create_dir_all(&data_dir).expect("Failed to create data dir");
+    std::fs::create_dir_all(&data_dir).map_err(|e| {
+        format!(
+            "Failed to create data directory '{}': {}. \
+            If using host mounts, ensure the directory exists and has correct permissions: \
+            mkdir -p {} && chown -R 65532:65532 {}",
+            data_dir.display(),
+            e,
+            data_dir.display(),
+            data_dir.display()
+        )
+    })?;
 
     let pool = {
-        let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-            format!(
-                "sqlite://{}?mode=rwc",
-                std::path::Path::new(&data_dir)
-                    .join("hubble.db")
-                    .to_string_lossy()
-            )
-        });
-
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
         let pool = SqlitePoolOptions::new()
             .max_connections(2) // avoid locking
             .acquire_timeout(Duration::from_secs(30))
