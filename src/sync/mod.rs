@@ -1,84 +1,143 @@
-use crate::sync::{ensure_file::ensure_file, import_file::import_file, importers::get_importers};
+use crate::sync::{
+    ensure_file::ensure_file, file_meta::FileMeta, import_file::import_file,
+    importers::get_importers,
+};
 use anyhow::Result;
-use importer::ImporterScheduling;
-use std::{collections::HashMap, path::PathBuf};
-use tantivy::Index;
-use tracing::info;
-use update_index::update_index;
+use futures::future::try_join_all;
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
+use tokio::{
+    sync::{Mutex, Notify},
+    task::JoinHandle,
+};
 
 mod ensure_file;
+mod file_meta;
 mod import_file;
-mod importer;
 mod importers;
 mod nullable;
-mod update_index;
 
-pub async fn sync_data(data_dir: &PathBuf, index: &Index, pool: &sqlx::SqlitePool) -> Result<()> {
-    let start = std::time::Instant::now();
+pub async fn sync_data(data_dir: &PathBuf, pool: &sqlx::SqlitePool) -> Result<()> {
     let importers = get_importers();
     let cache_dir = data_dir.join("cache");
 
     // ensure data dir exits
     std::fs::create_dir_all(&cache_dir).unwrap();
 
-    // ensure all files are downloaded and up to date in parallel
-    let mut handles: HashMap<&str, tokio::task::JoinHandle<bool>> = HashMap::new();
-    for importer in &importers {
-        let importer_name = importer.get_name();
-        let file_path = cache_dir.join(importer_name);
-        let file_url = importer.get_url().to_string();
+    let mut tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
+    let basics_done = Arc::new(Mutex::new((false, Arc::new(Notify::new()))));
+    let needs_search_update = Arc::new(AtomicBool::new(false));
+    for importer in importers {
+        let pool = pool.clone();
+        let basics_done = basics_done.clone();
+        let cache_dir = cache_dir.clone();
+        let needs_search_update = needs_search_update.clone();
+        tasks.push(tokio::spawn(async move {
+            let file_name = importer.get_name();
+            let file_path = cache_dir.join(file_name);
+            let mut meta = FileMeta::new(&file_path)?;
 
-        let handle = tokio::spawn(async move { ensure_file(&file_path, &file_url).await.unwrap() });
+            ensure_file(&mut meta, importer.get_url()).await?;
 
-        handles.insert(importer_name, handle);
+            let is_basics = file_name == "title.basics.tsv.gz";
+            let is_akas = file_name == "title.akas.tsv.gz";
+            if !is_basics {
+                let basics_done = basics_done.lock().await;
+                if !basics_done.0 {
+                    let notifier = basics_done.1.clone();
+                    drop(basics_done); // or else we hold the lock while waiting
+                    tracing::debug!(file = file_name, "waiting for basics to finish");
+                    notifier.notified().await;
+                    tracing::debug!(file = file_name, "waited for basics");
+                }
+            }
+
+            if !meta.imported_at.is_some() {
+                import_file(&pool, &importer, &mut meta).await?;
+                if is_basics || is_akas {
+                    needs_search_update.store(true, Ordering::Relaxed);
+                }
+            }
+
+            if is_basics {
+                let mut basics_done = basics_done.lock().await;
+                basics_done.0 = true;
+                basics_done.1.notify_waiters();
+            }
+
+            Ok(())
+        }))
     }
 
-    let mut was_changed: HashMap<String, bool> = HashMap::new();
-    for (name, handle) in handles.iter_mut() {
-        was_changed.insert(name.to_string(), handle.await.unwrap());
-    }
+    try_join_all(tasks).await?;
 
-    // if any file changes, we have to re-import basics to make sure
-    // known_ids contains all the ids in the csv.
-    // todo: if basics did not change, scan through without inserting
-    let was_any_changed = was_changed.values().any(|v| *v);
-    if was_any_changed {
-        let basics_importer = importers
-            .iter()
-            .find(|i| i.get_scheduling() == ImporterScheduling::IsBasics)
-            .unwrap();
+    if needs_search_update.load(Ordering::Relaxed) {
+        // update the search index
+        tracing::info!("rebuilding search index");
+        let start = Instant::now();
+        let mut tx = pool.begin().await?;
 
-        let name = basics_importer.get_name();
-        was_changed.insert(name.to_string(), true);
-    }
+        // Clear the search index
+        sqlx::query!("DELETE FROM search_index")
+            .execute(&mut *tx)
+            .await?;
 
-    // known_ids avoids foreign key constraint issues
-    // sometimes rows show up with references that don't exist
-    // (either imdb includes them in the data, or its due to us discarding some rows)
-    // so we just store all the IDs we've seen during importing.
-    let mut known_ids = roaring::RoaringBitmap::new();
-    for importer in &importers {
-        let was_changed = was_changed.get(importer.get_name()).unwrap();
-        if !was_changed {
-            continue;
-        }
-
-        import_file(
-            importer,
-            &mut known_ids,
-            &cache_dir.join(importer.get_name()),
-            &pool,
+        // Insert deduplicated titles with priority for primary titles over AKAs
+        sqlx::query!(
+            "WITH combined_titles AS (
+                -- Primary titles (highest priority)
+                SELECT 
+                    primary_title as text, 
+                    1 as is_display, 
+                    id as title_id, 
+                    0 as ordering,
+                    1 as priority
+                FROM titles 
+                WHERE primary_title IS NOT NULL AND primary_title != ''
+                
+                UNION ALL
+                
+                -- AKA titles (lower priority, ordered by their original ordering)
+                SELECT 
+                    title as text, 
+                    0 as is_display, 
+                    id as title_id, 
+                    ordering,
+                    2 as priority
+                FROM akas 
+                WHERE title IS NOT NULL AND title != ''
+            ),
+            deduplicated AS (
+                SELECT 
+                    text, 
+                    is_display, 
+                    title_id, 
+                    ordering,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY text, title_id 
+                        ORDER BY priority ASC, ordering ASC
+                    ) as rn
+                FROM combined_titles
+            )
+            INSERT INTO search_index (text, is_display, title_id, ordering)
+            SELECT text, is_display, title_id, ordering
+            FROM deduplicated
+            WHERE rn = 1"
         )
-        .await
-        .unwrap();
+        .execute(&mut *tx)
+        .await?;
+
+        tracing::debug!("committing search index changes");
+        tx.commit().await?;
+        tracing::info!("search index rebuild complete in {:?}", start.elapsed());
     }
 
-    if was_any_changed {
-        info!("Updating index");
-        update_index(index, pool).await?;
-    }
-
-    let elapsed = start.elapsed();
-    info!("Synced all data in {:?}", elapsed);
+    tracing::info!("up to date");
     Ok(())
 }

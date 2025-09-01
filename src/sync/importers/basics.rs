@@ -1,15 +1,13 @@
 use crate::id::Id;
 use crate::kind::TitleKind;
-use crate::sync::importer::Importer;
-use crate::sync::importer::ImporterScheduling;
+use crate::sync::importers::Importer;
 use crate::sync::nullable::nullable;
 use anyhow::Result;
 use csv_async::StringRecord;
-use roaring::RoaringBitmap;
 use serde::Deserialize;
 use serde_with::serde_as;
 use serde_with::BoolFromInt;
-use sqlx::{QueryBuilder, Transaction};
+use sqlx::{QueryBuilder, SqlitePool};
 
 #[serde_as]
 #[derive(Debug, Deserialize)]
@@ -53,18 +51,13 @@ impl Importer for BasicsImporter {
         9
     }
 
-    fn get_scheduling(&self) -> ImporterScheduling {
-        ImporterScheduling::IsBasics
-    }
-
     async fn write_batch(
         &self,
-        known_ids: &mut RoaringBitmap,
+        pool: &SqlitePool,
         headers: &StringRecord,
         rows: Vec<StringRecord>,
-        tx: &mut Transaction<'_, sqlx::Sqlite>,
     ) -> Result<()> {
-        let mut qb = QueryBuilder::new("INSERT INTO titles (id, type, primary_title, original_title, is_adult, start_year, end_year, runtime_minutes, genres) ");
+        let mut qb = QueryBuilder::new("INSERT OR REPLACE INTO titles (id, type, primary_title, original_title, is_adult, start_year, end_year, runtime_minutes, genres) ");
 
         let rows: Vec<BasicsRow> = rows
             .into_iter()
@@ -79,8 +72,6 @@ impl Importer for BasicsImporter {
                 Some(row.original_title)
             };
 
-            known_ids.insert(id);
-
             let kind = row.title_type as i32;
             qb.push_bind(id)
                 .push_bind(kind)
@@ -93,20 +84,8 @@ impl Importer for BasicsImporter {
                 .push_bind(row.genres);
         });
 
-        qb.push(
-            " ON CONFLICT(id) DO UPDATE SET
-                type = excluded.type,
-                primary_title = excluded.primary_title,
-                original_title = excluded.original_title,
-                is_adult = excluded.is_adult,
-                start_year = excluded.start_year,
-                end_year = excluded.end_year,
-                runtime_minutes = excluded.runtime_minutes,
-                genres = excluded.genres",
-        );
-
         let query = qb.build();
-        query.execute(tx.as_mut()).await?;
+        query.execute(pool).await?;
         Ok(())
     }
 }

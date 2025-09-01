@@ -41,3 +41,12 @@ CREATE TABLE episodes (
     FOREIGN KEY (id) REFERENCES titles(id),
     FOREIGN KEY (parent_id) REFERENCES titles(id)
 ) STRICT;
+
+CREATE VIRTUAL TABLE search_index USING fts5(
+    text,
+    is_display,
+    title_id UNINDEXED,
+    ordering UNINDEXED
+);
+
+CREATE INDEX idx_episode_parent_id ON episodes(parent_id);

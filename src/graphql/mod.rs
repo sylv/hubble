@@ -2,10 +2,7 @@ use std::collections::HashMap;
 
 use crate::id::Id;
 use async_graphql::{dataloader::DataLoader, Context, Object, Result};
-use tantivy::{
-    collector::TopDocs, query::QueryParser, schema::Value, DocId, Index, IndexReader, Score,
-    SegmentReader, TantivyDocument,
-};
+use sqlx::SqlitePool;
 use title::{Title, TitleLoader, TitleWithRank};
 
 mod episode;
@@ -30,63 +27,58 @@ impl Query {
     ) -> Result<Vec<TitleWithRank>> {
         let mut ids = ids.unwrap_or_default();
         let mut scores = HashMap::new();
-        let index = ctx.data::<Index>()?;
-        let reader = ctx.data::<IndexReader>()?;
+        let pool = ctx.data::<SqlitePool>()?;
 
         if let Some(query) = query {
-            let searcher = reader.searcher();
+            let limit = limit.unwrap_or(25) as i64;
+            let escaped_query = query.replace(":", "");
+            let search_results = sqlx::query!(
+                r#"
+                SELECT 
+                    si.title_id AS "title_id: i64",
+                    -bm25(search_index)
+                    +
+                    (
+                        CASE
+                            WHEN r.num_votes < 10 THEN 1.0
+                            WHEN r.num_votes < 100 THEN 1.5
+                            WHEN r.num_votes < 1000 THEN 2.0
+                            WHEN r.num_votes < 10000 THEN 2.5
+                            ELSE 2.5
+                        END
+                    )
+                    +
+                    (
+                        CASE 
+                            WHEN si.is_display = 1 THEN 1.0 
+                            ELSE -5.0 
+                        END
+                    ) AS final_score
+                FROM search_index si
+                LEFT JOIN ratings r ON r.id = si.title_id
+                LEFT JOIN titles t ON t.id = si.title_id
+                WHERE 
+                    text MATCH ?
+                    AND r.id IS NOT NULL 
+                    AND t.type IN (0, 1, 3, 4, 6, 10)
+                ORDER BY final_score DESC
+                LIMIT ?
+                "#,
+                escaped_query,
+                limit
+            )
+            .fetch_all(pool)
+            .await?;
 
-            let title_field = index.schema().get_field("title").unwrap();
-            let id_field = index.schema().get_field("id").unwrap();
-
-            let query_parser = QueryParser::for_index(index, vec![title_field]);
-
-            let limit = limit.unwrap_or(25);
-            let query = query_parser.parse_query(&query).unwrap();
-            let top_docs = searcher
-                .search(
-                    &query,
-                    &TopDocs::with_limit(limit).tweak_score(
-                        move |segment_reader: &SegmentReader| {
-                            let votes_reader = segment_reader
-                                .fast_fields()
-                                .u64("votes")
-                                .unwrap()
-                                .first_or_default_col(0);
-
-                            let is_display_reader = segment_reader
-                                .fast_fields()
-                                .bool("is_display")
-                                .unwrap()
-                                .first_or_default_col(false);
-
-                            move |doc: DocId, original_score: Score| {
-                                let votes: u64 = votes_reader.get_val(doc);
-                                let is_display: bool = is_display_reader.get_val(doc);
-                                let display_modifier = if is_display { 1.0 } else { -5.0 };
-                                original_score * ((votes as f32).log10()) + display_modifier
-                            }
-                        },
-                    ),
-                )
-                .unwrap();
-
-            for (score, doc_address) in top_docs {
-                let retrieved_doc: TantivyDocument = searcher.doc(doc_address).unwrap();
-                let imdb_id: Id = retrieved_doc
-                    .get_first(id_field)
-                    .unwrap()
-                    .as_u64()
-                    .unwrap()
-                    .into();
-
-                ids.push(imdb_id);
-                scores.insert(imdb_id, score);
+            for result in search_results {
+                let title_id: Id = result.title_id.expect("missing title_id").into();
+                ids.push(title_id);
+                scores.insert(title_id, result.final_score as f32);
             }
-        }
-
-        if ids.is_empty() {
-            return Err("No IDs to filter for".into());
+        } else {
+            if ids.is_empty() {
+                return Err("'query' or 'ids' is required'".into());
+            }
         }
 
         let loader = ctx.data::<DataLoader<TitleLoader>>()?;

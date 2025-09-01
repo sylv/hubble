@@ -1,10 +1,9 @@
 use crate::sync::nullable::nullable;
-use crate::{id::Id, sync::importer::Importer};
+use crate::{id::Id, sync::importers::Importer};
 use anyhow::Result;
 use csv_async::StringRecord;
-use roaring::RoaringBitmap;
 use serde::Deserialize;
-use sqlx::{QueryBuilder, Transaction};
+use sqlx::{QueryBuilder, SqlitePool};
 
 #[derive(Debug, Deserialize)]
 struct EpisodesRow {
@@ -37,25 +36,17 @@ impl Importer for EpisodesImporter {
 
     async fn write_batch(
         &self,
-        known_ids: &mut RoaringBitmap,
+        pool: &SqlitePool,
         headers: &StringRecord,
         rows: Vec<StringRecord>,
-        tx: &mut Transaction<'_, sqlx::Sqlite>,
     ) -> Result<()> {
         let mut qb = QueryBuilder::new(
-            "INSERT INTO episodes (id, parent_id, season_number, episode_number) ",
+            "INSERT OR REPLACE INTO episodes (id, parent_id, season_number, episode_number) ",
         );
         let rows: Vec<EpisodesRow> = rows
             .into_iter()
-            .filter_map(|row| {
-                let row: EpisodesRow = row.deserialize(Some(headers)).ok()?;
-                if known_ids.contains(row.tconst.get() as u32) {
-                    Some(row)
-                } else {
-                    None
-                }
-            })
-            // Filter out rows with null season or episode numbers
+            .filter_map(|row| row.deserialize(Some(headers)).ok())
+            // filter out rows with null season or episode numbers
             .filter(|row: &EpisodesRow| row.season_number.is_some() && row.episode_number.is_some())
             .collect();
 
@@ -66,15 +57,8 @@ impl Importer for EpisodesImporter {
                 .push_bind(row.episode_number);
         });
 
-        qb.push(
-            " ON CONFLICT(id) DO UPDATE SET
-                parent_id = excluded.parent_id,
-                season_number = excluded.season_number,
-                episode_number = excluded.episode_number",
-        );
-
         let query = qb.build();
-        query.execute(tx.as_mut()).await?;
+        query.execute(pool).await?;
         Ok(())
     }
 }

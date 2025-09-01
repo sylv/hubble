@@ -1,18 +1,8 @@
 # hubble
 
-hubble exposes the [IMDb datasets](https://developer.imdb.com/non-commercial-datasets/) as a GraphQL API.
-It will auto-update when new datasets are released.
-Why the name? Uhhhh....
+hubble exposes the [IMDb datasets](https://developer.imdb.com/non-commercial-datasets/) as a GraphQL API and automatically updates to the latest version without downtime.
 
 ## setup
-
-> [!CAUTION]
-> The IMDb datasets are intended for personal and non-commercial use only. Make sure you comply with the licensing terms listed [here](https://developer.imdb.com/non-commercial-datasets/).
-
-
-`/data` is used to store the downloaded datasets, the database, and the search index.
-`/data` will use around 5GB of space.
-hubble will download about 1GB of data every day.
 
 ```bash
 docker run --rm -p 8000:8000 -v hubble-data:/data sylver/hubble

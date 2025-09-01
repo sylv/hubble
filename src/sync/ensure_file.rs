@@ -1,27 +1,9 @@
+use crate::sync::file_meta::FileMeta;
 use anyhow::Result;
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
-use std::{io::Write, path::PathBuf};
-use tracing::info;
+use std::io::Write;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct FileMeta {
-    downloaded_at: chrono::DateTime<chrono::Utc>,
-    etag: Option<String>,
-    last_modified: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-pub async fn ensure_file(file_path: &PathBuf, url: &str) -> Result<bool> {
-    let meta_path = file_path.with_extension("json");
-    let meta = match std::fs::read_to_string(&meta_path) {
-        Ok(meta) => serde_json::from_str::<FileMeta>(&meta)?,
-        Err(_) => FileMeta {
-            downloaded_at: chrono::Utc::now(),
-            etag: None,
-            last_modified: None,
-        },
-    };
-
+pub async fn ensure_file(meta: &mut FileMeta, url: &str) -> Result<bool> {
     let client = reqwest::Client::new();
     let mut request = client.get(url);
     if let Some(etag) = &meta.etag {
@@ -35,41 +17,54 @@ pub async fn ensure_file(file_path: &PathBuf, url: &str) -> Result<bool> {
     let response = request.send().await?.error_for_status()?;
     match response.status() {
         reqwest::StatusCode::OK => {
-            info!("Downloading {:?}", file_path);
-            let etag = response
+            meta.etag = response
                 .headers()
                 .get("ETag")
                 .map(|v| v.to_str().unwrap().to_string());
-            let last_modified = response.headers().get("Last-Modified").map(|v| {
+
+            meta.last_modified = response.headers().get("Last-Modified").map(|v| {
                 chrono::DateTime::parse_from_rfc2822(v.to_str().unwrap())
                     .unwrap()
                     .with_timezone(&chrono::Utc)
             });
 
-            let mut file = std::fs::File::create(&file_path)?;
+            if meta.path.exists() {
+                let content_length = response
+                    .headers()
+                    .get("Content-Length")
+                    .map(|v| v.to_str().unwrap().parse::<u64>().unwrap());
+
+                if let Some(content_length) = content_length {
+                    let disk_size = meta.path.metadata().unwrap().len();
+                    if disk_size == content_length {
+                        tracing::debug!(
+                            file = ?meta.path,
+                            "skipping download, file on disk matches remote"
+                        );
+                        meta.save()?;
+                        return Ok(false);
+                    }
+                }
+            }
+
+            let mut file = std::fs::File::create(&meta.path)?;
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 file.write_all(&chunk?)?;
             }
 
-            let meta = FileMeta {
-                downloaded_at: chrono::Utc::now(),
-                etag,
-                last_modified,
-            };
-
-            let meta = serde_json::to_string(&meta)?;
-            std::fs::write(&meta_path, meta)?;
-            info!("Downloaded {:?}", file_path);
+            meta.imported_at = None;
+            meta.save()?;
+            tracing::info!(file = ?meta.path, "downloaded file");
             Ok(true)
         }
         reqwest::StatusCode::NOT_MODIFIED => {
-            info!("{:?} is up to date", file_path);
+            tracing::info!(file = ?meta.path, "skipping download, remote confirms our version is up to date");
             Ok(false)
         }
         code => Err(anyhow::anyhow!(
             "Unexpected status code for {:?}: {}",
-            file_path,
+            meta.path,
             code
         )),
     }

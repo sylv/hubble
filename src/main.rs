@@ -9,7 +9,6 @@ use axum::{
 };
 use graphql::title::TitleLoader;
 use graphql::Query;
-use index::get_index;
 use sqlx::sqlite::{
     SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
 };
@@ -23,7 +22,6 @@ use tracing::info;
 
 mod graphql;
 mod id;
-mod index;
 mod kind;
 mod sync;
 
@@ -82,28 +80,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         pool
     };
 
-    let index = get_index(&data_dir).unwrap();
-
     let pool_clone = pool.clone();
-    let index_clone = index.clone();
     tokio::spawn(async move {
         loop {
-            sync_data(&data_dir, &index_clone, &pool_clone)
-                .await
-                .unwrap();
+            sync_data(&data_dir, &pool_clone).await.unwrap();
             tokio::time::sleep(Duration::from_secs(14400)).await; // 4 hours
         }
     });
 
-    let reader = index.reader()?;
     let schema = Schema::build(Query, EmptyMutation, EmptySubscription)
         .data(DataLoader::new(
             TitleLoader::new(pool.clone()),
             tokio::spawn,
         ))
         .data(pool)
-        .data(index)
-        .data(reader)
         .finish();
 
     let app = Router::new().route("/", get(graphiql).post_service(GraphQL::new(schema)));

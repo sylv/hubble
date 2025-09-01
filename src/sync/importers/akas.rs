@@ -1,13 +1,13 @@
 use crate::id::Id;
-use crate::sync::importer::Importer;
+use crate::sync::importers::Importer;
 use crate::sync::nullable::nullable;
 use anyhow::Result;
 use csv_async::StringRecord;
-use roaring::RoaringBitmap;
 use serde::Deserialize;
 use serde_with::serde_as;
 use serde_with::BoolFromInt;
-use sqlx::{QueryBuilder, Transaction};
+use sqlx::QueryBuilder;
+use sqlx::SqlitePool;
 
 #[serde_as]
 #[derive(Debug, Deserialize)]
@@ -47,25 +47,17 @@ impl Importer for AkasImporter {
 
     async fn write_batch(
         &self,
-        known_ids: &mut RoaringBitmap,
+        pool: &SqlitePool,
         headers: &StringRecord,
         rows: Vec<StringRecord>,
-        tx: &mut Transaction<'_, sqlx::Sqlite>,
     ) -> Result<()> {
         let mut qb = QueryBuilder::new(
-            "INSERT INTO akas (id, ordering, title, region, language, types, attributes, is_original_title) "
+            "INSERT OR REPLACE INTO akas (id, ordering, title, region, language, types, attributes, is_original_title) "
         );
 
         let rows: Vec<AkasRow> = rows
             .into_iter()
-            .filter_map(|row| {
-                let row: AkasRow = row.deserialize(Some(headers)).ok()?;
-                if known_ids.contains(row.title_id.get() as u32) {
-                    Some(row)
-                } else {
-                    None
-                }
-            })
+            .filter_map(|row| row.deserialize(Some(headers)).ok())
             .collect();
 
         qb.push_values(rows, |mut qb, row| {
@@ -79,18 +71,8 @@ impl Importer for AkasImporter {
                 .push_bind(row.is_original_title);
         });
 
-        qb.push(
-            " ON CONFLICT(id, ordering) DO UPDATE SET
-                title = excluded.title,
-                region = excluded.region,
-                language = excluded.language,
-                types = excluded.types,
-                attributes = excluded.attributes,
-                is_original_title = excluded.is_original_title",
-        );
-
         let query = qb.build();
-        query.execute(tx.as_mut()).await?;
+        query.execute(pool).await?;
         Ok(())
     }
 }

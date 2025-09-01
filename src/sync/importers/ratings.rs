@@ -1,9 +1,8 @@
-use crate::{id::Id, sync::importer::Importer};
+use crate::{id::Id, sync::importers::Importer};
 use anyhow::Result;
 use csv_async::StringRecord;
-use roaring::RoaringBitmap;
 use serde::Deserialize;
-use sqlx::{QueryBuilder, Transaction};
+use sqlx::{QueryBuilder, SqlitePool};
 
 #[derive(Debug, Deserialize)]
 struct RatingsRow {
@@ -32,22 +31,15 @@ impl Importer for RatingsImporter {
 
     async fn write_batch(
         &self,
-        known_ids: &mut RoaringBitmap,
+        pool: &SqlitePool,
         headers: &StringRecord,
         rows: Vec<StringRecord>,
-        tx: &mut Transaction<'_, sqlx::Sqlite>,
     ) -> Result<()> {
-        let mut qb = QueryBuilder::new("INSERT INTO ratings (id, average_rating, num_votes) ");
+        let mut qb =
+            QueryBuilder::new("INSERT OR REPLACE INTO ratings (id, average_rating, num_votes) ");
         let rows: Vec<RatingsRow> = rows
             .into_iter()
-            .filter_map(|row| {
-                let row: RatingsRow = row.deserialize(Some(headers)).ok()?;
-                if known_ids.contains(row.tconst.get() as u32) {
-                    Some(row)
-                } else {
-                    None
-                }
-            })
+            .filter_map(|row| row.deserialize(Some(headers)).ok())
             .collect();
 
         qb.push_values(rows, |mut qb, row| {
@@ -56,14 +48,8 @@ impl Importer for RatingsImporter {
                 .push_bind(row.num_votes);
         });
 
-        qb.push(
-            " ON CONFLICT(id) DO UPDATE SET
-                average_rating = excluded.average_rating,
-                num_votes = excluded.num_votes",
-        );
-
         let query = qb.build();
-        query.execute(tx.as_mut()).await?;
+        query.execute(pool).await?;
         Ok(())
     }
 }
